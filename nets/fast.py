@@ -214,6 +214,15 @@ def _fastbb_in():
     return _FB[0]
 
 
+if (
+    FASTBB_ENC
+):  # the fastbb encoder path is optional: plain torch encoder when fastbb is not installed
+    try:
+        _fastbb_in()
+    except ImportError:
+        FASTBB_ENC = ""
+
+
 def _conv_nb(m, x, o):
     """conv without bias (followed by an instance norm)."""
     if o["hacc"]:
