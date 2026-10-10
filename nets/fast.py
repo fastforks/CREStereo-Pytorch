@@ -14,7 +14,12 @@ Changes vs. upstream forward (same math unless noted):
   - half: pure fp16 weights/activations, fp32 flow state, fp32 attention (1/16 res) and convex upsampling
   - cl: channels_last; hacc: fp16-accumulate cuDNN convs (precompiled engines only, nets/cudnn_conv.py)
   - kern: fused warp + group correlation kernel (no warped feature map, no 36 mul/mean passes) and fused GRU gates
+  - fused (CRE_FUSED=1, default with kern): CUTLASS implicit-GEMM convs with the epilogue applied from registers
+    (nets/cutlass_conv.cu, port of RAFT-Stereo exp 002 v8, compiled once, any size): SepConvGRU z|r conv + gates and
+    q conv + state update for the 1x5 / 5x1 convs, conv + bias + relu for >= 128 output channels
 """
+
+import os
 
 import torch
 import torch.nn as nn
@@ -23,6 +28,85 @@ import torch.nn.functional as F
 from .attention import PositionEncodingSine
 
 _K = [None]
+FUSED = os.environ.get("CRE_FUSED", "1") == "1"
+_FC = [None]
+
+
+def fused():
+    if _FC[0] is None:
+        from .cutlass_conv import EpiArgs, FusedConvs
+
+        _FC[0] = (FusedConvs.get(), EpiArgs)
+    return _FC[0]
+
+
+def fused_cfg(P):
+    """Fixed size rule (results/2026-10-09_fused_probe.txt): 128x128x32/3st tile, 64x128x64/4st for small problems."""
+    return 0 if P >= 7000 else 1
+
+
+def _conv_fused(m, x, w, b, act, out=None, out2=None, kmin=128):
+    """conv + bias + act as one CUTLASS kernel, or None (not applicable -> cuDNN path). out / out2: (tensor, channel
+    offset) destinations inside wider channels-last buffers (out2: second copy, same row stride as out)."""
+    if (
+        m is None
+        or m.groups != 1
+        or tuple(m.dilation) != (1, 1)
+        or m.stride[0] != m.stride[1]
+        or x.shape[0] != 1
+        or w.shape[0] < kmin
+        or w.shape[0] % 8
+        or w.shape[1] % 8
+        or not isinstance(m.padding, tuple)
+        or not x.is_contiguous(memory_format=torch.channels_last)
+        or getattr(m, "_nofuse", False)
+    ):
+        return None
+    fc, E = fused()
+    _, C, H, W = x.shape
+    K = w.shape[0]
+    (R, S), (ph, pw), st = w.shape[2:], m.padding, m.stride[0]
+    Ho, Wo = (H + 2 * ph - R) // st + 1, (W + 2 * pw - S) // st + 1
+    b32 = None
+    if b is not None:
+        b32 = m.__dict__.get("_b32")
+        if b32 is None or b32[0] is not b:
+            m._b32 = b32 = (b, b.float().contiguous())
+        b32 = b32[1]
+    if out is None:
+        y = torch.empty(
+            (1, K, Ho, Wo), device=x.device, dtype=x.dtype, memory_format=torch.channels_last
+        )
+        yp, ys = y.data_ptr(), K
+    else:
+        y, c0 = out
+        assert y.is_contiguous(memory_format=torch.channels_last) and tuple(y.shape[2:]) == (Ho, Wo)
+        yp, ys = y.data_ptr() + 2 * c0, y.shape[1]
+    y2p = None if out2 is None else out2[0].data_ptr() + 2 * out2[1]
+    e = E(
+        2,
+        int(act == "relu"),
+        None,
+        0,
+        yp,
+        ys,
+        None,
+        ys,
+        y2p,
+        None,
+        None,
+        None if b32 is None else b32.data_ptr(),
+        None,
+        0,
+        0,
+    )
+    rc = fc.run(fused_cfg(Ho * Wo), x, w, H, W, C, K, e, padding=(ph, pw), stride=st)
+    if rc == 1:
+        m._nofuse = True
+        return None
+    if rc:
+        raise RuntimeError(f"fused conv failed ({rc})")
+    return y
 
 
 def kern():
@@ -41,6 +125,10 @@ def conv(m, x, o, w=None, b="default", act=None):
     """conv2d of module m (or explicit weight w), bias, optional in-place activation."""
     w = m.weight if w is None else w
     b = (m.bias if m is not None else None) if isinstance(b, str) else b
+    if o.get("fused") and act in (None, "relu") and x.dim() == 4 and x.dtype == torch.float16:
+        y = _conv_fused(m, x, w, b, act)
+        if y is not None:
+            return y
     if o["hacc"]:
         from .cudnn_conv import conv_half_acc
 
@@ -182,6 +270,14 @@ def update(model, net, ctx, corr_feat, flow, o):
     ub = model.update_block
     enc, g = ub.encoder, ub.gru
     flow_h = flow.to(net.dtype)
+    if (
+        o.get("fused")
+        and net.shape[0] == 1
+        and net.is_contiguous(memory_format=torch.channels_last)
+    ):
+        r = _update_fused(model, net, ctx, corr_feat, flow_h, o)
+        if r is not None:
+            return r
     cor = conv(enc.convc1, corr_feat, o, w=enc._wc1, act="relu")
     cor = conv(enc.convc2, cor, o, act="relu")
     flo = conv(enc.convf1, _cl(flow_h, o), o, act="relu")
@@ -220,6 +316,91 @@ def update(model, net, ctx, corr_feat, flow, o):
     return net, delta[:, :2].float()
 
 
+def _update_fused(model, net, ctx, corr_feat, flow_h, o):
+    """update() with CUTLASS fused-epilogue convs: convc2 writes straight into the [cor | flo] buffer (no cat),
+    the motion conv (zero-padded to 128 outputs) writes into the x slots of both GRU buffers A = [h | x] (read by
+    the z|r convs) and B = [r*h | x] (read by the q convs, r*h written by the z|r epilogue); the q epilogue updates net
+    in place and (direction 1) h in A for the 5x1 z|r conv. Returns None if a conv geometry is unsupported."""
+    ub = model.update_block
+    enc, g = ub.encoder, ub.gru
+    fc, E = fused()
+    N, Hd, H, W = net.shape
+    cl = torch.channels_last
+    cor = conv(enc.convc1, corr_feat, o, w=enc._wc1, act="relu")
+    cf = torch.empty((N, 256, H, W), device=net.device, dtype=net.dtype, memory_format=cl)
+    if (
+        _conv_fused(
+            enc.convc2, cor, enc.convc2.weight, enc.convc2.bias, "relu", out=(cf, 0), kmin=64
+        )
+        is None
+    ):
+        return None
+    del cor
+    flo = conv(enc.convf1, _cl(flow_h, o), o, act="relu")
+    cf[:, 192:] = conv(
+        enc.convf2, flo, o, act="relu"
+    )  # 64-ch conv: cuDNN + bias_act + copy (fused was slower)
+    del flo
+    hx = torch.empty((N, 2 * Hd, H, W), device=net.device, dtype=net.dtype, memory_format=cl)
+    rhx = torch.empty_like(hx)
+    if (
+        _conv_fused(enc.conv, cf, enc._w128, enc._b128, "relu", out=(hx, Hd), out2=(rhx, Hd))
+        is None
+    ):
+        return None
+    del cf
+    hx[:, :Hd] = net
+    hx[:, 2 * Hd - 2 :] = flow_h
+    rhx[:, 2 * Hd - 2 :] = flow_h
+    P = H * W
+    zr = torch.empty((N, 2 * Hd, H, W), device=net.device, dtype=net.dtype, memory_format=cl)
+    ctot = 2 * Hd
+    for d in (1, 2):
+        czr, cq = ctx[d - 1]
+        pad = getattr(g, f"convz{d}").padding
+        e0 = E(
+            0,
+            0,
+            czr.data_ptr(),
+            2 * Hd,
+            zr.data_ptr(),
+            2 * Hd,
+            hx.data_ptr(),
+            ctot,
+            rhx.data_ptr(),
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
+        )
+        e1 = E(
+            1,
+            0,
+            cq.data_ptr(),
+            Hd,
+            zr.data_ptr(),
+            2 * Hd,
+            net.data_ptr(),
+            Hd,
+            None,
+            hx.data_ptr() if d == 1 else None,
+            None,
+            None,
+            None,
+            0,
+            ctot,
+        )
+        if fc.run(0, hx, g._w[f"zr_h{d}"], H, W, ctot, 2 * Hd, e0, padding=pad) or fc.run(
+            fused_cfg(P), rhx, g._w[f"q_h{d}"], H, W, ctot, Hd, e1, padding=pad
+        ):
+            raise RuntimeError("fused GRU conv failed")
+    fh = ub.flow_head
+    delta = conv(fh.conv2, conv(fh.conv1, net, o, act="relu"), o)
+    return net, delta[:, :2].float()
+
+
 def up_mask(model, net, o):
     m = model.update_block.mask
     return (0.25 * conv(m[2], conv(m[0], net, o, act="relu"), o)).float()
@@ -252,7 +433,10 @@ def prepare_inference(model, half=True, cl=True, hacc=True, kern=True):
         g._w[f"q_h{d}"] = torch.cat([wq[:, :128], wq[:, 256:]], 1).contiguous(memory_format=mf)
         g._w[f"q_i{d}"] = wq[:, 128:256].contiguous(memory_format=mf)
         g._w[f"q_b{d}"] = bq.contiguous()
-    model._fast = dict(half=half, cl=cl, hacc=hacc, kern=kern, dt=dt)
+    # motion conv zero-padded to 128 outputs for the fused path (the 2 extra channels are overwritten by the flow)
+    enc._w128 = F.pad(enc.conv.weight, (0, 0, 0, 0, 0, 0, 0, 2)).contiguous(memory_format=mf)
+    enc._b128 = F.pad(enc.conv.bias, (0, 2)).contiguous()
+    model._fast = dict(half=half, cl=cl, hacc=hacc, kern=kern, dt=dt, fused=FUSED and kern and hacc)
     if kern:
         globals()["kern"]()
     return model
