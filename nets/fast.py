@@ -173,7 +173,84 @@ def _resblock(blk, x, o):
     return y.add_(x).relu_()
 
 
+# Fused instance normalization uses centered FP32 statistics. Biases before IN cancel and are skipped.
+# CRE_FASTBB_ENC=0 selects torch; "friendly" keeps the channels-last PyTorch normalization.
+FASTBB_ENC = os.environ.get("CRE_FASTBB_ENC", "in")
+if FASTBB_ENC == "1":
+    FASTBB_ENC = "in"
+FASTBB_ENC = "" if FASTBB_ENC == "0" else FASTBB_ENC
+if FASTBB_ENC not in ("", "in", "friendly"):
+    raise ValueError("CRE_FASTBB_ENC must be in, friendly, or 0")
+_FB = [None]
+_NC = [None]
+
+
+def _normconv():
+    if _NC[0] is None:
+        try:
+            from fastbb import normconv
+        except ImportError:
+            import sys
+            sys.path.insert(0, "/home/florian/projects/experiments/006-fast-backbones")
+            from fastbb import normconv
+        normconv.load()
+        _NC[0] = normconv
+    return _NC[0]
+
+
+def _fastbb_in():
+    if _FB[0] is None:
+        try:
+            import fastbb.raft as fr
+        except ImportError:
+            import sys
+            sys.path.insert(0, "/home/florian/projects/experiments/006-fast-backbones")
+            import fastbb.raft as fr
+        import types
+
+        from fastbb_vendored import instnorm
+
+        _FB[0] = (fr._instance_norm_kernel, types.SimpleNamespace(eps=1e-5, affine=False))
+    return _FB[0]
+
+
+def _conv_nb(m, x, o):
+    """conv without bias (followed by an instance norm)."""
+    if o["hacc"]:
+        from .cudnn_conv import conv_half_acc
+
+        return conv_half_acc(x, m.weight, None, list(m.padding), list(m.stride))
+    return _cl(F.conv2d(x, m.weight, None, m.stride, m.padding), o)
+
+
+def _in_friendly(ns, x, mode=0, res=None):
+    """plain-PyTorch instance norm on NHWC fp16 (fp32 statistics, no layout copies; fastbb.raft._instance_norm_nhwc)."""
+    _fastbb_in()
+    import fastbb.raft as fr
+    y = fr._instance_norm_nhwc(ns, x)
+    if mode >= 1:
+        y = y.relu_()
+    return y.add_(res).relu_() if mode == 2 else y
+
+
+def _encoder_fastbb(enc, x, o):
+    IN, ns = _fastbb_in()
+    if FASTBB_ENC == "friendly":
+        IN = _in_friendly
+    x = IN(ns, _conv_nb(enc.conv1, x, o), 1)
+    for layer in (enc.layer1, enc.layer2, enc.layer3):
+        for blk in layer:
+            y = IN(ns, _conv_nb(blk.conv1, x, o), 1)
+            d = IN(ns, _conv_nb(blk.downsample[0], x, o), 0)
+            del x
+            x = IN(ns, _conv_nb(blk.conv2, y, o), 2, d)
+            del y, d
+    return conv(enc.conv2, x, o)
+
+
 def encoder(enc, x, o):
+    if FASTBB_ENC and o["kern"] and x.dtype == torch.float16:
+        return _encoder_fastbb(enc, x, o)
     x = _inorm_(conv(enc.conv1, x, o)).relu_()
     for layer in (enc.layer1, enc.layer2, enc.layer3):
         for blk in layer:
