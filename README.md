@@ -1,3 +1,22 @@
+# CREStereo-Pytorch: faster inference fork
+
+> **You are on `portable`.** Research fork of [ibaiGorordo/CREStereo-Pytorch](https://github.com/ibaiGorordo/CREStereo-Pytorch) (base `b6c7a9f`; `main` mirrors upstream). Two branches:
+> - [`portable`](https://github.com/fastforks/CREStereo-Pytorch/tree/portable): plain PyTorch, exports to ONNX / TensorRT, no build step.
+> - [`cuda-kernels`](https://github.com/fastforks/CREStereo-Pytorch/tree/cuda-kernels): `portable` plus custom CUDA kernels (prebuilt cubin for sm_120 and CUTLASS convs for sm_80/86/89/120; other GPUs need a rebuild with `nvcc`).
+> Licence: upstream has none; see upstream repository
+
+CREStereo, ETH3D checkpoint, 20 iterations; upstream = fp32. RTX 5060 Ti 16 GB, torch 2.14.1+cu130, TensorRT 11.4, 2026-10-10. Median of 10 runs; memory = torch peak allocated / reserved (TensorRT: process GPU memory).
+
+| version | KITTI ms | Midd-H ms | Midd-F ms | speed-up at H | peak MB at H (alloc / reserved) | peak MB at F (alloc / reserved) | startup / new size | ETH3D EPE | Midd-H EPE |
+|---|---|---|---|---|---|---|---|---|---|
+| upstream | 595 | 1925 | 7800 | 1.00x | 1642 / 1974 | 6237 / 7424 | 1.05 s / 0.00 s | 0.185 | 0.753 |
+| **portable** | 250 | 915 | 3908 | 2.10x | 1079 / 1166 | 4069 / 4444 | 1.14 s / 0.01 s | 0.185 | 0.750 |
+| portable → TensorRT | 100 | 315 | 1419 | 6.11x | 766 | 5766 | 1.76 s / none | 0.185 | 0.762 |
+| **cuda-kernels** | 89 | 238 | 937 | 8.09x | 619 / 668 | 2277 / 2482 | 1.09 s / 0.05 s | 0.185 | 0.745 |
+
+
+---
+
 # CREStereo-Pytorch
  Non-official Pytorch implementation of the CREStereo (CVPR 2022 Oral) model converted from the original MegEngine implementation.
 
