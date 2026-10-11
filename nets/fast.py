@@ -182,35 +182,15 @@ FASTBB_ENC = "" if FASTBB_ENC == "0" else FASTBB_ENC
 if FASTBB_ENC not in ("", "in", "friendly"):
     raise ValueError("CRE_FASTBB_ENC must be in, friendly, or 0")
 _FB = [None]
-_NC = [None]
-
-
-def _normconv():
-    if _NC[0] is None:
-        try:
-            from fastbb import normconv
-        except ImportError:
-            import os, sys
-            sys.path.insert(0, os.environ.get("FASTBB_PATH", os.devnull))  # pip install fastbb (fastforks/fastbb) or set FASTBB_PATH to a checkout
-            from fastbb import normconv
-        normconv.load()
-        _NC[0] = normconv
-    return _NC[0]
 
 
 def _fastbb_in():
     if _FB[0] is None:
-        try:
-            import fastbb.raft as fr
-        except ImportError:
-            import os, sys
-            sys.path.insert(0, os.environ.get("FASTBB_PATH", os.devnull))  # pip install fastbb (fastforks/fastbb) or set FASTBB_PATH to a checkout
-            import fastbb.raft as fr
         import types
 
         from fastbb_vendored import instnorm
 
-        _FB[0] = (fr._instance_norm_kernel, types.SimpleNamespace(eps=1e-5, affine=False))
+        _FB[0] = (instnorm._instance_norm_kernel, types.SimpleNamespace(eps=1e-5, affine=False))
     return _FB[0]
 
 
@@ -233,10 +213,11 @@ def _conv_nb(m, x, o):
 
 
 def _in_friendly(ns, x, mode=0, res=None):
-    """plain-PyTorch instance norm on NHWC fp16 (fp32 statistics, no layout copies; fastbb.raft._instance_norm_nhwc)."""
+    """plain-PyTorch instance norm on NHWC fp16 (fp32 statistics, no layout copies; fastbb_vendored.instnorm._instance_norm_nhwc)."""
     _fastbb_in()
-    import fastbb.raft as fr
-    y = fr._instance_norm_nhwc(ns, x)
+    from fastbb_vendored import instnorm
+
+    y = instnorm._instance_norm_nhwc(ns, x)
     if mode >= 1:
         y = y.relu_()
     return y.add_(res).relu_() if mode == 2 else y
